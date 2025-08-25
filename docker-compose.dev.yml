@@ -1,0 +1,176 @@
+version: '3.8'
+
+# Created automatically by Cursor AI (2024-01-XX)
+
+services:
+  # Database
+  postgres:
+    image: timescale/timescaledb:latest-pg14
+    container_name: trading_floor_postgres
+    environment:
+      POSTGRES_DB: trading_floor
+      POSTGRES_USER: trading_user
+      POSTGRES_PASSWORD: trading_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U trading_user -d trading_floor"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Redis for caching and Celery broker
+  redis:
+    image: redis:7-alpine
+    container_name: trading_floor_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # NATS for messaging
+  nats:
+    image: nats:2-alpine
+    container_name: trading_floor_nats
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+    command: nats-server --jetstream --http_port 8222
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8222/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # MinIO for object storage
+  minio:
+    image: minio/minio:latest
+    container_name: trading_floor_minio
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin123
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+  # Frontend (Next.js)
+  frontend:
+    build:
+      context: ./apps/frontend
+      dockerfile: Dockerfile.dev
+    container_name: trading_floor_frontend
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost:3001
+    volumes:
+      - ./apps/frontend:/app
+      - /app/node_modules
+    depends_on:
+      - gateway
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # API Gateway (NestJS)
+  gateway:
+    build:
+      context: ./apps/gateway
+      dockerfile: Dockerfile.dev
+    container_name: trading_floor_gateway
+    ports:
+      - "3001:3001"
+    environment:
+      - DATABASE_URL=postgresql://trading_user:trading_password@postgres:5432/trading_floor
+      - REDIS_URL=redis://redis:6379
+      - NATS_URL=nats://nats:4222
+      - JWT_SECRET=your-jwt-secret-key-here
+      - FRONTEND_URL=http://localhost:3000
+    volumes:
+      - ./apps/gateway:/app
+      - /app/node_modules
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Orchestrator (FastAPI)
+  orchestrator:
+    build:
+      context: ./apps/orchestrator
+      dockerfile: Dockerfile.dev
+    container_name: trading_floor_orchestrator
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://trading_user:trading_password@postgres:5432/trading_floor
+      - REDIS_URL=redis://redis:6379
+      - NATS_URL=nats://nats:4222
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+    volumes:
+      - ./apps/orchestrator:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Workers (Celery)
+  workers:
+    build:
+      context: ./apps/workers
+      dockerfile: Dockerfile.dev
+    container_name: trading_floor_workers
+    environment:
+      - DATABASE_URL=postgresql://trading_user:trading_password@postgres:5432/trading_floor
+      - REDIS_URL=redis://redis:6379
+      - NATS_URL=nats://nats:4222
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+    volumes:
+      - ./apps/workers:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+    command: celery -A celery_app worker --loglevel=info --concurrency=4
+
+volumes:
+  postgres_data:
+  redis_data:
+  minio_data:
